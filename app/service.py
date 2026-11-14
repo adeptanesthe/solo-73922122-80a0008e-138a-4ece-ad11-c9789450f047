@@ -63,21 +63,25 @@ def canonical_content(rev: RevisionPayload) -> str:
 
 # ---------------------------------------------------------------- 查询
 
-def _row_to_state(row: sqlite3.Row) -> dict:
-    effective = None
+def _effective_of(row: sqlite3.Row) -> Optional[dict]:
+    """从观测/变更记录行中还原有效值（含删除标记）；非 valid 时为 None。"""
     if row["status"] == "valid" and row["eff_revision_id"] is not None:
-        effective = {
+        return {
             "revision_id": row["eff_revision_id"],
             "species": row["eff_species"],
             "count": row["eff_count"],
             "deleted": bool(row["eff_deleted"]),
         }
+    return None
+
+
+def _row_to_state(row: sqlite3.Row) -> dict:
     return {
         "observation_id": row["observation_id"],
         "status": row["status"],
         "tips": json.loads(row["tips"]),
         "missing_ancestors": json.loads(row["missing"]),
-        "effective": effective,
+        "effective": _effective_of(row),
         "version": row["version"],
     }
 
@@ -125,6 +129,55 @@ def list_revisions(conn: sqlite3.Connection, observation_id: str) -> list[dict]:
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------- 变更流
+
+def _row_to_change(row: sqlite3.Row) -> dict:
+    return {
+        "seq": row["seq"],
+        "observation_id": row["observation_id"],
+        "status": row["status"],
+        "tips": json.loads(row["tips"]),
+        "missing_ancestors": json.loads(row["missing"]),
+        "effective": _effective_of(row),
+        "version": row["version"],
+        "recorded_at": row["recorded_at"],
+    }
+
+
+def _record_change(
+    conn: sqlite3.Connection,
+    observation_id: str,
+    status: str,
+    tips_json: str,
+    missing_json: str,
+    eff: tuple,
+    version: int,
+) -> None:
+    """在同一事务中追加一条变更记录：当时的完整结论快照（含删除标记），此后不可变。"""
+    conn.execute(
+        "INSERT INTO observation_changes (observation_id, status, tips, missing, "
+        "eff_revision_id, eff_species, eff_count, eff_deleted, version) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (observation_id, status, tips_json, missing_json, *eff, version),
+    )
+
+
+def list_changes(conn: sqlite3.Connection, since: int, limit: int) -> dict:
+    """按序号游标限量领取变更：只返回 seq > since 的记录，按提交次序升序。
+
+    写事务经 BEGIN IMMEDIATE 串行提交，seq 的分配次序即提交次序，因此
+    翻页（seq > 游标）不会重读也不会漏读。next_cursor 取本次最后一条已返回
+    记录的序号（空页则保持原游标），下一游标只会越过已返回的记录。
+    """
+    rows = conn.execute(
+        "SELECT * FROM observation_changes WHERE seq > ? ORDER BY seq LIMIT ?",
+        (since, limit),
+    ).fetchall()
+    changes = [_row_to_change(r) for r in rows]
+    next_cursor = changes[-1]["seq"] if changes else since
+    return {"changes": changes, "next_cursor": next_cursor}
 
 
 # ---------------------------------------------------------------- 重算
@@ -188,6 +241,8 @@ def recompute_observation(conn: sqlite3.Connection, observation_id: str) -> dict
             "VALUES (?,?,?,?,?,?,?,?,1)",
             (observation_id, status, tips_json, missing_json, *eff),
         )
+        # 新观测的首个结论也是一条变更（同事务记录完整快照）
+        _record_change(conn, observation_id, status, tips_json, missing_json, eff, 1)
     else:
         current = (
             prev["status"], prev["tips"], prev["missing"], prev["eff_revision_id"],
@@ -200,6 +255,10 @@ def recompute_observation(conn: sqlite3.Connection, observation_id: str) -> dict
                 "WHERE observation_id=?",
                 (status, tips_json, missing_json, *eff, observation_id),
             )
+            # 结论（状态/当前分支/未齐祖先/有效值）确实变化才记录；
+            # 纯重传与无影响的写入不会走到这里，不产生记录
+            _record_change(conn, observation_id, status, tips_json, missing_json,
+                           eff, prev["version"] + 1)
     return get_observation(conn, observation_id)  # type: ignore[return-value]
 
 

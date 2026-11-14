@@ -85,6 +85,29 @@ class RevisionOut(BaseModel):
     received_at: str
 
 
+class ChangeRecord(BaseModel):
+    """一条观测变更：结论变化当时在同一事务中落库的完整快照（不可变）。"""
+
+    seq: int = Field(description="变更序号：提交次序，单调递增")
+    observation_id: str
+    status: str = Field(description="当时结论：pending=待补齐 / valid=有效 / conflict=冲突")
+    tips: list[str] = Field(description="当时当前分支（无后继的修订）")
+    missing_ancestors: list[str] = Field(description="当时未齐祖先（待补齐的修订号）")
+    effective: Optional[EffectiveValue] = Field(
+        description="当时有效值（含删除标记 deleted）；待补齐或冲突时为 null"
+    )
+    version: int = Field(description="当时观测状态版本")
+    recorded_at: str = Field(description="记录时间（UTC）")
+
+
+class ChangePage(BaseModel):
+    changes: list[ChangeRecord] = Field(description="本页变更，按 seq 升序")
+    next_cursor: int = Field(
+        description="下一页游标：等于本页最后一条记录的 seq（空页保持原游标），"
+        "只会越过已返回的记录"
+    )
+
+
 # ------------------------------------------------------------------ 应用
 
 @asynccontextmanager
@@ -95,13 +118,17 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="野外调查观测更正汇交 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "汇合多台离线设备对同一观测的更正：修订按 DAG 组织，允许子先父后乱序到达；"
         "祖先未齐标 **pending**（不出有效值），补齐自动重算；单分支为 **valid**；"
         "多分支（含改值与删除并存）为 **conflict**，需人工裁决。"
         "裁决以所见全部分支为父，提交时分支已变返回 409；"
         "同号同内容重传幂等，异内容/循环/跨观测引用整包拒绝。"
+        "**观测变更流**：自启用起，上报或裁决改变观测结论（状态/当前分支/未齐祖先/有效值）"
+        "即在同一事务中按提交次序记录当时的完整结论（含删除标记），"
+        "拒绝与纯重传不产生记录；`GET /changes` 按序号游标限量领取，"
+        "下一游标只越过已返回的记录，不重读、不漏读，分析库可据此撤回失效值。"
     ),
     lifespan=lifespan,
 )
@@ -176,6 +203,24 @@ def get_observation_revisions(observation_id: str):
         if state is None:
             raise HTTPException(status_code=404, detail="观测不存在")
         return service.list_revisions(conn, observation_id)
+
+
+@app.get("/changes", response_model=ChangePage, tags=["变更流"])
+def get_changes(
+    since: int = Query(default=0, ge=0, description="序号游标：仅返回 seq 大于此值的变更"),
+    limit: int = Query(default=100, ge=1, le=1000, description="单页最大条数"),
+):
+    """领取观测变更流。
+
+    自启用起，每次上报/裁决改变观测结论都在同一 SQLite 事务中按提交次序
+    记录当时的完整结论（状态、当前分支、未齐祖先、有效值，含删除标记）；
+    被拒绝的请求与纯重传不产生记录。记录不可变：翻页、双进程交错写入或
+    重启后，旧记录仍保留原结论。用响应中的 `next_cursor` 作为下一次的
+    `since` 即可不重读、不漏读；当有效值变化、转为冲突/待补齐或被删除时，
+    分析库可据此撤回已同步的失效值。
+    """
+    with read_tx() as conn:
+        return service.list_changes(conn, since, limit)
 
 
 @app.post(

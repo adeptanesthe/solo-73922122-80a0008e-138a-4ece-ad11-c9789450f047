@@ -52,6 +52,25 @@ CREATE TABLE IF NOT EXISTS observations (
     eff_deleted      INTEGER NOT NULL DEFAULT 0,
     version          INTEGER NOT NULL           -- 状态版本，每次变化 +1
 );
+
+-- 观测变更流：自启用起，每次结论变化在同一事务中追加一条不可变快照。
+-- 写事务一律 BEGIN IMMEDIATE 串行提交，因此 seq 的分配次序即提交次序：
+-- 任何快照若包含 seq=N+1，必已包含 seq<=N 的全部记录，游标翻页不重读、不漏读。
+CREATE TABLE IF NOT EXISTS observation_changes (
+    seq              INTEGER PRIMARY KEY AUTOINCREMENT, -- 变更序号（提交次序，单调递增）
+    observation_id   TEXT NOT NULL,
+    status           TEXT NOT NULL,             -- 当时结论：pending | valid | conflict
+    tips             TEXT NOT NULL,             -- JSON 数组：当时当前分支
+    missing          TEXT NOT NULL,             -- JSON 数组：当时未齐祖先
+    eff_revision_id  TEXT,                      -- 当时有效值来源修订（单分支时）
+    eff_species      TEXT,
+    eff_count        INTEGER,
+    eff_deleted      INTEGER NOT NULL DEFAULT 0,-- 删除标记（有效值为删除结论时为 1）
+    version          INTEGER NOT NULL,          -- 当时观测状态版本
+    recorded_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_observation_changes_obs
+    ON observation_changes(observation_id);
 """
 
 
